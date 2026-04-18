@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Modal</title>
+<style>
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <main>
+    <h1>Modal demo</h1>
+    <button id="open" type="button">Open dialog</button>
+    <div id="dialog" role="dialog" aria-label="settings" class="hidden">
+      <h2>Settings</h2>
+      <p>Pick a thing.</p>
+      <button id="confirm" type="button">Confirm</button>
+      <button id="cancel" type="button">Cancel</button>
+    </div>
+    <p id="status">idle</p>
+  </main>
+  <script>
+    const dlg = document.getElementById('dialog');
+    const open = document.getElementById('open');
+    const confirm = document.getElementById('confirm');
+    const cancel = document.getElementById('cancel');
+    const status = document.getElementById('status');
+    open.addEventListener('click', () => dlg.classList.remove('hidden'));
+    confirm.addEventListener('click', () => { dlg.classList.add('hidden'); status.textContent = 'confirmed'; });
+    cancel.addEventListener('click', () => { dlg.classList.add('hidden'); status.textContent = 'cancelled'; });
+  </script>
+</body>
+</html>

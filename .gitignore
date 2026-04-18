@@ -1,0 +1,33 @@
+.DS_Store
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Playwright cache
+.playwright/
+
+# Personal application materials — never commit
+*_Resume.*
+*_Cover_Letter.*
+*resume*.pdf
+*resume*.docx
+*cover*letter*.pdf
+*cover*letter*.docx
+applicant/
+
+# Wayfinder-local runtime (encrypted identities, cookies)
+.wayfinder/
+identities/

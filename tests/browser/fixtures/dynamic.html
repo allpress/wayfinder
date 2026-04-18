@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Dynamic</title></head>
+<body>
+  <main>
+    <h1>Dynamic list</h1>
+    <button id="add" type="button">Add row</button>
+    <ul id="rows"></ul>
+    <p id="count">count: 0</p>
+  </main>
+  <script>
+    const rows = document.getElementById('rows');
+    const count = document.getElementById('count');
+    let n = 0;
+    document.getElementById('add').addEventListener('click', () => {
+      n += 1;
+      const li = document.createElement('li');
+      li.textContent = 'row ' + n;
+      rows.appendChild(li);
+      count.textContent = 'count: ' + n;
+    });
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        const p = document.createElement('p');
+        p.id = 'arrived';
+        p.textContent = 'arrived';
+        document.querySelector('main').appendChild(p);
+      }, 200);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Form Fixture</title></head>
+<body>
+  <main>
+    <h1>Sign up</h1>
+    <form id="signup" action="/echo" method="post">
+      <p><label for="email">Email</label>
+         <input id="email" name="email" type="email" required placeholder="you@example.com"></p>
+      <p><label for="name">Full name</label>
+         <input id="name" name="name" type="text" placeholder="Jane Doe"></p>
+      <p><label for="password">Password</label>
+         <input id="password" name="password" type="password" required></p>
+      <p><label for="country">Country</label>
+         <select id="country" name="country">
+           <option value="US">United States</option>
+           <option value="UK">United Kingdom</option>
+           <option value="NL">Netherlands</option>
+         </select></p>
+      <p><label><input id="tos" name="tos" type="checkbox"> I accept the terms</label></p>
+      <p><button type="submit">Create account</button></p>
+    </form>
+  </main>
+</body>
+</html>

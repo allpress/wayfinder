@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Lazy Form</title></head>
+<body>
+  <main>
+    <h1>Lazy form</h1>
+    <button id="apply" type="button">Apply</button>
+    <div id="form_container"></div>
+  </main>
+  <script>
+    const btn = document.getElementById('apply');
+    const container = document.getElementById('form_container');
+    btn.addEventListener('click', () => {
+      setTimeout(() => {
+        container.innerHTML = `
+          <form id="lazy">
+            <p><label for="fn">First Name</label><input id="fn" name="first_name"></p>
+            <p><label for="ln">Last Name</label><input id="ln" name="last_name"></p>
+            <p><label for="em">Email</label><input id="em" name="email" type="email"></p>
+          </form>
+        `;
+      }, 250);
+    });
+  </script>
+</body>
+</html>

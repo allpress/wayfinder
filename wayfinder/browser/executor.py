@@ -139,7 +139,7 @@ class LocalExecutor:
         try:
             self._pw = sync_playwright().start()
             launcher = getattr(self._pw, self._browser_type)
-            self._browser = launcher.launch(headless=self._headless)
+            self._browser = launcher.launch(headless=self._headless, channel="chrome")
         except Exception as e:  # noqa: BLE001
             self._start_error = e
             self._ready.set()

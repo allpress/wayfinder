@@ -153,13 +153,44 @@ class GreenhouseApplicantWayfinder:
             emit(WayfinderEvent.now("progress", phase="form_opened",
                                      url=obs.url, handles=len(obs.handles)))
 
-            # If Greenhouse shows an "Apply" button first, click it.
-            apply_btn = _find_handle(obs.handles, role="button", name_like=r"^apply\b")
-            if apply_btn:
-                r = s.click(apply_btn)
-                if r.ok:
-                    obs = s.observe(viewport_only=False)
-                    emit(WayfinderEvent.now("progress", phase="apply_clicked"))
+            # Many Greenhouse boards (Anthropic among them) now embed the
+            # application form inline on the job posting — no modal, no
+            # redirect. If we already see form inputs, don't click "Apply";
+            # that button is the final Submit at the foot of the form, and
+            # firing it on a blank form either destroys the page or sends
+            # an empty application. Only click when no inputs are visible.
+            has_form_inputs = any(
+                h.role in _INTERACTABLE_ROLES
+                for h in (obs.handles or [])
+            )
+            if not has_form_inputs:
+                apply_btn = _find_handle(obs.handles, role="button",
+                                          name_like=r"^apply\b")
+                if apply_btn:
+                    r = s.click(apply_btn)
+                    if r.ok:
+                        obs = s.observe(viewport_only=False)
+                        emit(WayfinderEvent.now("progress", phase="apply_clicked"))
+            else:
+                emit(WayfinderEvent.now("progress", phase="form_inline",
+                                         interactable=sum(
+                                             1 for h in obs.handles
+                                             if h.role in _INTERACTABLE_ROLES
+                                         )))
+
+            # Upload files BEFORE question fills. The observer-DOM on
+            # Greenhouse degrades after a handful of React-driven input
+            # events (each fill triggers a re-render that wipes observer
+            # globals and thins the accessible tree). File inputs, being
+            # ``display:none`` and not tracked by the observer, are
+            # particularly vulnerable — if we wait, they vanish from the
+            # locator too. Do them first while the DOM is fresh.
+            _try_file_upload(s, obs, field_name="resume",
+                              label_hint="resume", path=resume_path, emit=emit)
+            if cover_path:
+                _try_file_upload(s, obs, field_name="cover_letter",
+                                  label_hint="cover letter",
+                                  path=cover_path, emit=emit)
 
             # Fill every question the plan knows about.
             for q in questions:
@@ -185,15 +216,21 @@ class GreenhouseApplicantWayfinder:
                     # Still try to answer if it's a select-yes; textareas we leave
                     # for the human to eyeball before submit.
 
-                handle = _find_handle_by_field_name(obs.handles, name)
+                handle = _find_handle_by_field_name(obs.handles, name, label=label)
                 if handle is None:
                     # Re-observe once in case the form lazy-rendered.
                     obs = s.observe(viewport_only=False)
-                    handle = _find_handle_by_field_name(obs.handles, name)
+                    handle = _find_handle_by_field_name(obs.handles, name, label=label)
                 if handle is None:
                     outcome.unhandled.append(label)
+                    observed = [
+                        {"role": h.role, "label": h.label, "name": h.name[:40]}
+                        for h in (obs.handles or [])[:25]
+                        if h.role in _INTERACTABLE_ROLES
+                    ]
                     emit(WayfinderEvent.now("error", phase="handle_not_found",
-                                             field=name, label=label))
+                                             field=name, label=label,
+                                             observed=observed))
                     continue
 
                 answer = str(q.get("proposedAnswer") or "")
@@ -220,15 +257,6 @@ class GreenhouseApplicantWayfinder:
                     emit(WayfinderEvent.now("progress", phase="field_filled",
                                              field=name, strategy=strategy))
                     obs = s.observe(viewport_only=False)
-
-            # Resume + cover letter uploads. Playwright locator.set_input_files
-            # isn't exposed on our Session yet — fall through to the executor's
-            # run() primitive. We look up the <input type=file> by fieldName.
-            _try_file_upload(s, obs, field_name="resume", path=resume_path, emit=emit)
-            if cover_path:
-                obs = s.observe(viewport_only=False)
-                _try_file_upload(s, obs, field_name="cover_letter",
-                                  path=cover_path, emit=emit)
 
             # Screenshot for review.
             shot = s.screenshot(full_page=True)
@@ -301,35 +329,97 @@ def _find_handle(handles: Any, *, role: str, name_like: str) -> str | None:
     return None
 
 
-def _find_handle_by_field_name(handles: Any, field_name: str) -> str | None:
-    """Greenhouse form fields aren't usually labelled with the field name
-    directly; Playwright's accessible-name resolution picks up the <label>
-    text. Match on label text first, then fall back to anything that mentions
-    the field name verbatim.
+_INTERACTABLE_ROLES = frozenset({
+    "textbox", "searchbox", "combobox", "listbox",
+    "radio", "checkbox", "spinbutton",
+})
+
+
+def _norm_label(s: str) -> str:
+    """Normalise a form label for matching.
+
+    Strips:
+    - trailing required markers: ``*``, ``✱``, ``⁎``, ``(required)``, `` required``
+    - ``(optional)`` anywhere
+    - surrounding whitespace and collapses internal whitespace
     """
-    # Try label that closely matches the field name (Greenhouse does this for
-    # things like ``first_name`` → label "First Name").
-    human = field_name.replace("_", " ").strip().lower()
+    if not s:
+        return ""
+    out = s.strip().lower()
+    out = re.sub(r"\s*[*✱⁎]+\s*$", "", out)
+    out = re.sub(r"\s*\(required\)\s*$", "", out)
+    out = re.sub(r"\s+required\s*$", "", out)
+    out = re.sub(r"\s*\(optional\)\s*", " ", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def _find_handle_by_field_name(handles: Any, field_name: str,
+                                label: str | None = None) -> str | None:
+    """Match a plan question to an observed handle.
+
+    Greenhouse forms don't expose their machine field names in the
+    accessible tree; Playwright's accessible-name resolver picks up the
+    ``<label>`` text plus any trailing required markers. Match order:
+
+    1. Exact match against the normalised plan ``label`` (if provided)
+       or the humanised ``field_name``, restricted to interactable roles.
+    2. Containment match (normalised target in normalised label) on
+       interactable roles.
+    3. Name-attribute containment for opaque ``question_NNNN`` fieldnames
+       or file inputs that lack a proper label.
+    """
+    targets: list[str] = []
+    if label:
+        t = _norm_label(label)
+        if t:
+            targets.append(t)
+    humanised = field_name.replace("_", " ")
+    t = _norm_label(humanised)
+    if t and t not in targets:
+        targets.append(t)
+
+    # Pass 1: exact normalised-label match on interactable roles.
     for h in handles or []:
-        if h.role in ("textbox", "searchbox", "combobox", "listbox") and \
-                (h.label or "").strip().lower() == human:
+        if h.role not in _INTERACTABLE_ROLES:
+            continue
+        h_lab = _norm_label(h.label or "")
+        if h_lab and h_lab in targets:
             return h.handle
-    # Next: any handle whose label contains the field name.
+    # Pass 2: containment (target ⊆ label) on interactable roles.
     for h in handles or []:
-        if field_name.lower() in (h.label or "").lower():
-            return h.handle
-    # Finally: name match.
+        if h.role not in _INTERACTABLE_ROLES:
+            continue
+        h_lab = _norm_label(h.label or "")
+        if not h_lab:
+            continue
+        for t in targets:
+            if t and t in h_lab:
+                return h.handle
+    # Pass 3: name-attribute containment — catches opaque fieldnames and
+    # file inputs that lack a proper accessible label.
+    fn_lc = field_name.lower()
     for h in handles or []:
-        if field_name.lower() in (h.name or "").lower():
+        if fn_lc and fn_lc in (h.name or "").lower():
             return h.handle
+        # Also allow hinted label to match name when label is just a hint.
+        for t in targets:
+            if t and t in (h.name or "").lower():
+                return h.handle
     return None
 
 
 def _try_file_upload(session: Any, obs: Any, *, field_name: str,
-                     path: str, emit: EmitFn) -> None:
-    """Best-effort file upload. Uses the Session's executor to drive the
-    underlying Playwright locator's ``set_input_files`` — wayfinder doesn't
-    expose a dedicated verb for this yet, so we reach through the executor.
+                     path: str, emit: EmitFn,
+                     label_hint: str | None = None) -> None:
+    """Best-effort file upload.
+
+    File inputs in Greenhouse (and most modern application forms) are
+    ``display: none`` and driven by a styled button sibling. The
+    accessible-name observer doesn't surface them, so the handle lookup
+    used for every other field would always miss. Go direct through
+    Playwright's CSS locator instead, matched on the ``name``/``id``
+    attribute of the hidden ``<input type="file">``.
     """
     import os
     if not path or not os.path.exists(path):
@@ -337,32 +427,72 @@ def _try_file_upload(session: Any, obs: Any, *, field_name: str,
                                  field=field_name, path=path))
         return
 
-    handle = _find_handle_by_field_name(obs.handles, field_name)
-    if handle is None:
-        emit(WayfinderEvent.now("error", phase="file_handle_not_found",
-                                 field=field_name))
-        return
-
-    # Resolve the handle to a Playwright Locator, then set_input_files.
-    from wayfinder.browser.observer import resolve_handle
     page = session._state.page if session._state else None    # noqa: SLF001
     if page is None:
+        emit(WayfinderEvent.now("error", phase="file_upload_failed",
+                                 field=field_name, detail="no active page"))
         return
 
-    loc, err, detail = session._executor.run(   # noqa: SLF001
-        resolve_handle, page, obs, handle,
-    )
-    if err is not None or loc is None:
-        emit(WayfinderEvent.now("error", phase="file_resolve_failed",
-                                 field=field_name, detail=detail))
-        return
+    def _upload_direct(pg: Any, p: str, fn: str,
+                       hint: str | None) -> tuple[str, str]:
+        # Greenhouse's hidden file input usually has either
+        # ``name="resume"``/``"cover_letter"`` directly, or the nested
+        # Rails form style ``name="job_application[resume]"``.
+        # Partial-match on name first, then id, for both the fieldname
+        # and the label hint.
+        tried: list[str] = []
+        candidates = [fn.lower()]
+        if hint:
+            h = hint.lower().replace(" ", "_")
+            if h not in candidates:
+                candidates.append(h)
+            # Also try hyphenated form.
+            h2 = hint.lower().replace(" ", "-")
+            if h2 not in candidates:
+                candidates.append(h2)
+        for c in candidates:
+            for sel in (f'input[type="file"][name*="{c}" i]',
+                        f'input[type="file"][id*="{c}" i]'):
+                tried.append(sel)
+                loc = pg.locator(sel)
+                try:
+                    n = loc.count()
+                except Exception:
+                    n = 0
+                if n > 0:
+                    loc.first.set_input_files(p, timeout=5000)
+                    return ("matched", sel)
+        # Single-file-input fallback: only for the mandatory "resume"
+        # slot. Don't fall through for optional fields like cover_letter
+        # — if there's no matching input, the form doesn't support that
+        # upload and we should skip rather than overwrite the resume.
+        if fn == "resume":
+            all_files = pg.locator('input[type="file"]')
+            try:
+                n = all_files.count()
+            except Exception:
+                n = 0
+            if n == 1:
+                all_files.first.set_input_files(p, timeout=5000)
+                return ("single", "input[type=file]")
+        return ("none", f"tried={tried}")
+
     try:
-        session._executor.run(lambda l, p: l.set_input_files(p), loc, path)   # noqa: SLF001
-        emit(WayfinderEvent.now("progress", phase="file_uploaded",
-                                 field=field_name, path=path))
+        outcome, detail = session._executor.run(   # noqa: SLF001
+            _upload_direct, page, path, field_name, label_hint,
+        )
     except Exception as e:   # noqa: BLE001
         emit(WayfinderEvent.now("error", phase="file_upload_failed",
-                                 field=field_name, detail=f"{type(e).__name__}: {e}"))
+                                 field=field_name,
+                                 detail=f"{type(e).__name__}: {e}"))
+        return
+
+    if outcome in ("matched", "single"):
+        emit(WayfinderEvent.now("progress", phase="file_uploaded",
+                                 field=field_name, path=path, via=detail))
+    else:
+        emit(WayfinderEvent.now("error", phase="file_handle_not_found",
+                                 field=field_name, detail=detail))
 
 
 def _fail(spawn_id: str, error: str) -> WayfinderReport:

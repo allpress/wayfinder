@@ -161,6 +161,68 @@ class Session:
         finally:
             self._state = None
 
+    def debug_dump(self) -> dict:
+        """Return a structured snapshot of the current session state.
+
+        Safe to call regardless of session state. Useful for tests and for
+        any caller that wants to introspect what wayfinder is actually
+        seeing — pages in the context, the active page URL, every handle
+        in the last observation (role / name / label / handle id), the
+        tail of console and network events.
+
+        Nothing in the return value is secret-shaped: handles are ids,
+        labels are scrubbed by the observer before they reach the session,
+        and URLs are already in-scope (we never snapshot off-scope pages).
+        """
+        state = self._state
+        if state is None:
+            return {"open": False}
+
+        pages_info: list[dict] = []
+        try:
+            pages = list(state.context.pages) if state.context is not None else []
+        except Exception as e:   # noqa: BLE001
+            pages = []
+            pages_info.append({"context_error": repr(e)})
+        for i, p in enumerate(pages):
+            entry: dict = {"index": i, "active": p is state.page}
+            try:
+                entry["url"] = self._executor.run(lambda pg: pg.url, p)
+            except Exception as e:   # noqa: BLE001
+                entry["url_error"] = repr(e)
+            try:
+                entry["title"] = self._executor.run(lambda pg: pg.title(), p)
+            except Exception as e:   # noqa: BLE001
+                entry["title_error"] = repr(e)
+            pages_info.append(entry)
+
+        obs = state.last_observation
+        handles_info: list[dict] = []
+        if obs is not None:
+            for h in obs.handles:
+                handles_info.append({
+                    "handle": h.handle,
+                    "role": h.role,
+                    "name": h.name,
+                    "label": h.label,
+                })
+
+        return {
+            "open": True,
+            "session_id": state.session_id,
+            "identity": state.identity,
+            "allowed_domains": list(state.allowed_domains),
+            "headless": state.headless,
+            "loaded_storage": state.loaded_storage,
+            "active_url": (obs.url if obs is not None
+                           else _current_url(self._executor, state)),
+            "pages": pages_info,
+            "handle_count": len(handles_info),
+            "handles": handles_info,
+            "console_tail": list(state.console_tail),
+            "network_tail_count": len(state.network_tail),
+        }
+
     def save_storage(self) -> SaveResult:
         state = self._require_state()
         if state is None:
@@ -236,7 +298,8 @@ class Session:
         if state is None:
             return Observation(url="", title="")
         try:
-            raw = self._executor.run(_do_snapshot, state.page, viewport_only)
+            raw = self._executor.run(_do_snapshot, state.page, viewport_only,
+                                      self._observer_js)
         except Exception as e:   # noqa: BLE001
             log.warning("snapshot failed: %s", e)
             raw = {"url": "", "title": "", "handles": [],
@@ -385,7 +448,8 @@ class Session:
                     return self._finalise_act(state, url_before)
             if handle_role is not None:
                 try:
-                    raw = self._executor.run(_do_snapshot, state.page, True)
+                    raw = self._executor.run(_do_snapshot, state.page, True,
+                                              self._observer_js)
                 except Exception:
                     raw = {"handles": []}
                 for h in raw.get("handles", []):
@@ -497,9 +561,17 @@ class Session:
 
     def _finalise_act(self, state: _SessionState, url_before: str) -> ActResult:
         before_obs = state.last_observation
+        # An action may have opened a new tab (Greenhouse Apply pattern) or
+        # triggered a same-page navigation. Re-bind state.page to the newest
+        # page in the context and wait for it to be ready before snapshotting.
+        try:
+            self._executor.run(_rebind_newest_page, state, self._observer_js)
+        except Exception as e:   # noqa: BLE001
+            log.info("rebind_newest_page failed: %s", e)
         # Take a fresh snapshot and compute diff.
         try:
-            raw = self._executor.run(_do_snapshot, state.page, True)
+            raw = self._executor.run(_do_snapshot, state.page, True,
+                                      self._observer_js)
         except Exception as e:   # noqa: BLE001
             log.info("post-action snapshot failed: %s", e)
             raw = None
@@ -530,11 +602,84 @@ class Session:
 
 def _new_page(context: Any, observer_js: str) -> Any:
     page = context.new_page()
+    # Cap every Playwright operation so a frozen page becomes a fast
+    # TimeoutError instead of a process hang. 10s for actions, 15s for
+    # navigations — both generous for real interactions but short enough
+    # that a bot-detection stall or a wiped observer doesn't lock the
+    # submission loop forever.
+    try:
+        page.set_default_timeout(10000)
+        page.set_default_navigation_timeout(15000)
+    except Exception:
+        pass
     page.add_init_script(observer_js)
     # Install directly in the current page too (add_init_script only applies
     # to navigations after attach, not the initial about:blank).
     page.evaluate(observer_js)
     return page
+
+
+def _rebind_newest_page(state: _SessionState, observer_js: str) -> None:
+    """Rebind state.page to the most recent page in the context.
+
+    Handles two post-action cases:
+    - A click opened the next step in a new tab (common for SPA apply
+      flows, Auth0 login redirects, etc.). state.page is still the
+      original tab, which now has nothing useful on it.
+    - A click caused a same-page navigation that's still in flight.
+
+    In both cases we wait for the newest page to reach domcontentloaded
+    before returning; that lets the caller snapshot a settled DOM.
+
+    Set ``WAYFINDER_DEBUG=1`` to see every rebind decision on stderr.
+    """
+    try:
+        pages = list(state.context.pages) if state.context is not None else []
+    except Exception as e:   # noqa: BLE001
+        _dbg(f"[rebind] context.pages failed: {e!r}")
+        return
+    if not pages:
+        _dbg("[rebind] no pages in context")
+        return
+    newest = pages[-1]
+    is_new = newest is not state.page
+    cur_url = ""
+    try:
+        cur_url = newest.url
+    except Exception:
+        pass
+    _dbg(f"[rebind] pages={len(pages)} is_new={is_new} url={cur_url!r}")
+    try:
+        newest.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception as e:   # noqa: BLE001
+        _dbg(f"[rebind] wait_for_load_state raised: {e!r}")
+    if is_new:
+        try:
+            newest.add_init_script(observer_js)
+        except Exception as e:   # noqa: BLE001
+            _dbg(f"[rebind] add_init_script: {e!r}")
+        try:
+            newest.evaluate(observer_js)
+        except Exception as e:   # noqa: BLE001
+            _dbg(f"[rebind] evaluate: {e!r}")
+        try:
+            newest.bring_to_front()
+        except Exception:
+            pass
+        state.page = newest
+        try:
+            final_url = state.page.url
+        except Exception:
+            final_url = "?"
+        _dbg(f"[rebind] rebound state.page -> {final_url!r}")
+
+
+def _dbg(msg: str) -> None:
+    """Debug-print to stderr when WAYFINDER_DEBUG is set. No-op otherwise."""
+    import os as _os
+    if _os.environ.get("WAYFINDER_DEBUG"):
+        import sys as _sys
+        print(msg, file=_sys.stderr)
 
 
 def _install_page_hooks(page: Any, state: _SessionState, allowed: list[str],
@@ -605,9 +750,19 @@ def _do_nav_verb(page: Any, verb: str) -> None:
         raise ValueError(f"unknown nav verb: {verb}")
 
 
-def _do_snapshot(page: Any, viewport_only: bool) -> dict[str, Any]:
-    # Re-inject in case the page navigated to a hostile frame and the
-    # add_init_script version was swapped out.
+def _do_snapshot(page: Any, viewport_only: bool,
+                 observer_js: str = "") -> dict[str, Any]:
+    # React re-renders, same-origin SPA route changes, and any page
+    # script that touches ``delete window.__wayfinder__`` can wipe the
+    # observer binding mid-session. Re-inject the observer script
+    # unconditionally before every snapshot. Cheap (tens of ms, plain
+    # JS eval, no network), and it keeps every later ``observe()``
+    # honest even on React-heavy forms like Greenhouse.
+    if observer_js:
+        try:
+            page.evaluate(observer_js)
+        except Exception:
+            pass
     try:
         return page.evaluate(
             "(opts) => window.__wayfinder__ && window.__wayfinder__.snapshot(opts)",

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Opens New Tab</title></head>
+<body>
+  <main>
+    <h1>Opens new tab</h1>
+    <a id="open_form" href="/form.html" target="_blank" rel="noopener">Open form</a>
+    <a id="open_form_js" href="#">Open form (JS)</a>
+  </main>
+  <script>
+    document.getElementById('open_form_js').addEventListener('click', (e) => {
+      e.preventDefault();
+      window.open('/form.html', '_blank');
+    });
+  </script>
+</body>
+</html>

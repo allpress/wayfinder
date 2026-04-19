@@ -222,18 +222,15 @@ class GreenhouseApplicantPlain:
                 except Exception:
                     shot_b64 = None
 
+                submission_evidence: dict = {}
                 if not pause:
-                    try:
-                        submit = _find_submit_button(page)
-                        submit.click(timeout=6000)
-                        page.wait_for_load_state("domcontentloaded", timeout=10000)
-                        submitted = True
-                        final_url = page.url
-                        emit(WayfinderEvent.now("progress", phase="submitted",
-                                                 url=final_url))
-                    except Exception as e:   # noqa: BLE001
-                        emit(WayfinderEvent.now("error", phase="submit_failed",
-                                                 detail=f"{type(e).__name__}: {e}"))
+                    submission_evidence = _submit_and_verify(
+                        page, original_url=url, emit=emit,
+                    )
+                    submitted = bool(submission_evidence.get("confirmed"))
+                    final_url = submission_evidence.get(
+                        "final_url", final_url,
+                    )
                 else:
                     emit(WayfinderEvent.now("status", phase="paused_for_review"))
                     # Block until the human closes the window.
@@ -252,6 +249,7 @@ class GreenhouseApplicantPlain:
                         "unhandled": unhandled,
                         "final_url": final_url,
                         "screenshot_b64": shot_b64,
+                        "submission": submission_evidence,
                     },
                 )
             finally:
@@ -562,6 +560,125 @@ def _fill_react_dropdown(page: Any, label: str, value: str) -> bool:
     except Exception:
         pass
     return False
+
+
+_CONFIRMATION_PHRASES = (
+    # Greenhouse-standard confirmation text variants — the ones this code
+    # has actually seen in the wild. Ordered roughly most→least specific.
+    "thank you for applying",
+    "thank you for your application",
+    "thanks for applying",
+    "thanks for your application",
+    "your application has been submitted",
+    "your application has been received",
+    "we've received your application",
+    "we have received your application",
+    "application received",
+    "application submitted",
+    "application confirmation",
+    "successfully submitted",
+    "your application is now under review",
+    "under review",
+    # "You've already applied" is also a confirmation — proves a prior
+    # submission was accepted, which is what we're trying to verify.
+    "you've already applied",
+    "you have already applied",
+    "already applied to this",
+    "duplicate application",
+)
+
+
+def _submit_and_verify(page: Any, *, original_url: str,
+                        emit: EmitFn) -> dict:
+    """Click the Submit button, wait for the page to settle, then
+    capture enough evidence to confirm (or refute) that the submission
+    actually went through.
+
+    Returns a dict with keys:
+        clicked              — did the Submit click succeed
+        url_changed          — did page.url differ from ``original_url``
+        confirmation_found   — did body text match a known confirmation phrase
+        matched_phrase       — which phrase matched (empty if none)
+        confirmed            — True iff (url_changed OR confirmation_found)
+        final_url            — page.url after the wait
+        page_title           — document.title after the wait
+        response_text        — first ~1500 chars of body innerText
+        error                — only present when the click itself failed
+
+    Greenhouse's SPA routing means URL changes aren't guaranteed on
+    every board; some boards stay on the same /jobs/<id> URL and swap
+    the DOM to a "Thanks" block. That's why we check both signals.
+    """
+    result: dict = {
+        "clicked": False,
+        "confirmed": False,
+        "url_changed": False,
+        "confirmation_found": False,
+        "matched_phrase": "",
+        "final_url": original_url,
+        "page_title": "",
+        "response_text": "",
+    }
+
+    try:
+        submit = _find_submit_button(page)
+        submit.click(timeout=6000)
+        result["clicked"] = True
+    except Exception as e:   # noqa: BLE001
+        result["error"] = f"{type(e).__name__}: {e}"
+        emit(WayfinderEvent.now("error", phase="submit_click_failed",
+                                 detail=result["error"]))
+        return result
+
+    # Wait for the post-submit page to settle. networkidle catches the
+    # AJAX-style boards; an explicit timeout gives React time to render
+    # the confirmation block on in-place boards.
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+    try:
+        result["final_url"] = page.url
+    except Exception:
+        pass
+    result["url_changed"] = result["final_url"] != original_url
+    try:
+        result["page_title"] = page.title() or ""
+    except Exception:
+        pass
+    try:
+        text = page.evaluate("() => document.body ? document.body.innerText : ''")
+        result["response_text"] = (text or "").strip()[:1500]
+    except Exception:
+        pass
+
+    low = result["response_text"].lower()
+    for phrase in _CONFIRMATION_PHRASES:
+        if phrase in low:
+            result["confirmation_found"] = True
+            result["matched_phrase"] = phrase
+            break
+
+    result["confirmed"] = bool(
+        result["url_changed"] or result["confirmation_found"]
+    )
+
+    emit(WayfinderEvent.now(
+        "progress" if result["confirmed"] else "error",
+        phase="submit_verified" if result["confirmed"] else "submit_unverified",
+        final_url=result["final_url"],
+        url_changed=result["url_changed"],
+        confirmation_found=result["confirmation_found"],
+        matched_phrase=result["matched_phrase"],
+        response_preview=result["response_text"][:280],
+    ))
+
+    return result
 
 
 def _find_submit_button(page: Any) -> Any:

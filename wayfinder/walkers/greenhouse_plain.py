@@ -59,6 +59,7 @@ _SPEC = WayfinderSpec(
     allowed_inputs=frozenset({
         "plan", "resume_pdf_path", "cover_letter_pdf_path",
         "headless", "pause_before_submit",
+        "applicant_profile",
     }),
     secret_refs_allowed=False,
 )
@@ -89,6 +90,9 @@ class GreenhouseApplicantPlain:
         cover_path = inputs.get("cover_letter_pdf_path") or None
         headless = bool(inputs.get("headless", False))
         pause = bool(inputs.get("pause_before_submit", True))
+        profile = inputs.get("applicant_profile") or {}
+        if not isinstance(profile, dict):
+            profile = {}
 
         try:
             from playwright.sync_api import sync_playwright
@@ -188,6 +192,26 @@ class GreenhouseApplicantPlain:
                             field=name, label=label,
                             detail=f"{type(e).__name__}: {str(e)[:100]}",
                         ))
+
+                # ---- standard Greenhouse client-side fields ----
+                # Country, Gender, Hispanic/Latino, Veteran, Disability,
+                # and the phone country-code picker are rendered by
+                # Greenhouse's boilerplate template and never show up in
+                # the job-board API, so the plan never asks us to fill
+                # them. Do it here from the profile instead.
+                eeoc_filled, eeoc_missing = _fill_standard_fields(
+                    page, profile, emit,
+                )
+                filled += eeoc_filled
+
+                # ---- post-fill audit: which required fields are still empty ----
+                empty_required = _audit_required_empty(page)
+                if empty_required:
+                    emit(WayfinderEvent.now(
+                        "finding", phase="required_unfilled",
+                        count=len(empty_required),
+                        fields=empty_required[:20],
+                    ))
 
                 # ---- screenshot, submit or pause ----
                 final_url = page.url
@@ -299,6 +323,219 @@ def _upload_cover(page: Any, path: str, emit: EmitFn) -> None:
         except Exception:
             continue
     emit(WayfinderEvent.now("finding", phase="cover_letter_slot_absent"))
+
+
+def _fill_standard_fields(page: Any, profile: dict,
+                           emit: EmitFn) -> tuple[int, list[str]]:
+    """Fill Greenhouse's boilerplate client-side-only fields.
+
+    These fields (``#country``, ``#gender``, ``#hispanic_ethnicity``,
+    ``#veteran_status``, ``#disability_status``, and the phone
+    country-code picker) are rendered by Greenhouse's template and
+    don't appear in the job-board JSON, so the plan builder never
+    generates questions for them. We match by stable id and fill from
+    the applicant profile. Every entry is best-effort — if the field
+    isn't on this form, we skip silently.
+
+    Returns ``(filled_count, missing_fields)`` — ``missing_fields``
+    lists ids we tried to fill that weren't present on the page.
+    """
+    filled = 0
+    missing: list[str] = []
+
+    # Mapping: (field_id, label_for_emit, profile_key, default_when_blank)
+    # Values must match one of Greenhouse's standard option labels — these
+    # are the exact strings the React menu renders, verified against live
+    # Scale AI + Anthropic boards.
+    plan = [
+        ("country",            "Country",           None,                   "United States"),
+        ("gender",             "Gender",            "gender",               None),
+        ("hispanic_ethnicity", "Hispanic/Latino",   "hispanic_or_latino",   None),
+        ("veteran_status",     "Veteran status",    "veteran_status",       None),
+        ("disability_status",  "Disability status", "disability_status",
+                                                     "I do not want to answer"),
+    ]
+
+    for fid, human_label, profile_key, default in plan:
+        loc = page.locator(f"#{fid}")
+        try:
+            if loc.count() == 0:
+                continue
+        except Exception:
+            continue
+
+        value = ""
+        if profile_key:
+            value = str(profile.get(profile_key) or "").strip()
+        if not value and default:
+            value = default
+        if not value:
+            continue  # field present but profile says to skip (e.g. disability)
+
+        # Close any picker that might still be open from a previous field
+        # (the phone country-code widget is especially sticky and floods
+        # the role=option list with country names).
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(100)
+        except Exception:
+            pass
+
+        try:
+            if _fill_react_dropdown(page, human_label, value):
+                emit(WayfinderEvent.now(
+                    "progress", phase="standard_field_filled",
+                    field=fid, value=value,
+                ))
+                filled += 1
+            else:
+                missing.append(fid)
+                emit(WayfinderEvent.now(
+                    "error", phase="standard_field_failed",
+                    field=fid, value=value,
+                ))
+        except Exception as e:   # noqa: BLE001
+            missing.append(fid)
+            emit(WayfinderEvent.now(
+                "error", phase="standard_field_failed",
+                field=fid, detail=f"{type(e).__name__}: {str(e)[:80]}",
+            ))
+
+    # Phone country code: Greenhouse uses the intl-tel-input library.
+    # Clicking the flag opens a searchable list of countries. Prefer to
+    # just set the phone with a +1 prefix (the library auto-detects), but
+    # also try the explicit flag-click approach in case the phone field
+    # was already filled without prefix.
+    cc = str(profile.get("phone_country_code") or "").strip()
+    phone = str(profile.get("phone") or "").strip()
+    if cc and phone and not phone.startswith(cc):
+        try:
+            page.locator("#phone").fill(f"{cc} {phone}", timeout=3000)
+            emit(WayfinderEvent.now(
+                "progress", phase="standard_field_filled",
+                field="phone_with_country_code",
+                value=f"{cc} {phone}",
+            ))
+            filled += 1
+        except Exception:
+            pass
+
+    return filled, missing
+
+
+def _audit_required_empty(page: Any) -> list[dict]:
+    """Return a list of required fields on the page that are still empty.
+
+    Looks at DOM state after all fills have run. Used by the submitter
+    to surface anything the pipeline missed before the human is asked
+    to review. Inputs with ``required``/``aria-required`` and no value
+    (or an unselected combobox) are flagged.
+    """
+    try:
+        return page.evaluate("""
+            () => {
+              function labelFor(el) {
+                if (el.ariaLabel) return el.ariaLabel;
+                if (el.id) {
+                  const lab = document.querySelector(`label[for="${el.id}"]`);
+                  if (lab) return lab.innerText.trim();
+                }
+                let p = el.parentElement;
+                for (let d=0; p && d<5; d++, p=p.parentElement) {
+                  const l = p.querySelector('label');
+                  if (l) return l.innerText.trim();
+                }
+                return '';
+              }
+              function isHidden(el) {
+                if (el.type === 'hidden') return true;
+                if (el.hidden) return true;
+                // Check computed styles through the ancestor chain — a
+                // hidden parent hides the input even if the input itself
+                // has default styles. Greenhouse's React dropdowns keep
+                // a hidden backing input that would otherwise be flagged.
+                let cur = el;
+                while (cur && cur !== document.body) {
+                  const cs = getComputedStyle(cur);
+                  if (cs.display === 'none' || cs.visibility === 'hidden') return true;
+                  cur = cur.parentElement;
+                }
+                // File inputs are intentionally display:none in Greenhouse;
+                // the click target is a button sibling. Treat them as visible
+                // for audit purposes.
+                if (el.type === 'file') return false;
+                return false;
+              }
+              function isReactDropdown(el) {
+                // Greenhouse custom selects: the <input type="text"> is
+                // the dropdown's search box. The selected value lives in
+                // the component's internal state — el.value is always
+                // empty string. Detect these and check for a *visible*
+                // selected-value indicator elsewhere in the widget.
+                if (el.type !== 'text' && el.type !== 'search') return null;
+                if (el.getAttribute('role') === 'combobox') return el;
+                // Greenhouse wraps dropdown inputs in a container with
+                // role=combobox or data-testid/class containing "select".
+                let p = el.parentElement;
+                for (let d=0; p && d<6; d++, p=p.parentElement) {
+                  if (p.getAttribute('role') === 'combobox') return p;
+                  if ((p.className || '').match(/select-__?single-value|select-__?value-container/)) return p;
+                }
+                return null;
+              }
+              function dropdownHasSelection(widget) {
+                // Greenhouse's React-select wraps the chosen value in a
+                // container that gets the modifier class
+                // ``select__value-container--has-value`` when populated.
+                // Walk widget + ancestors to find it.
+                let node = widget;
+                for (let d=0; node && d<8; d++, node=node.parentElement) {
+                  const cls = (node.className || '').toString();
+                  if (cls.includes('value-container--has-value')) return true;
+                  if (cls.includes('singleValue')) return true;
+                  // Generic: any descendant that visually shows a picked value.
+                  const picked = node.querySelector(
+                    '[class*="value-container--has-value"],'
+                    + ' [class*="singleValue"],'
+                    + ' [class*="single-value"]'
+                  );
+                  if (picked) return true;
+                }
+                return false;
+              }
+              const out = [];
+              for (const el of document.querySelectorAll(
+                  'input, select, textarea'
+              )) {
+                const req = el.required || el.getAttribute('aria-required')==='true';
+                if (!req) continue;
+                if (isHidden(el)) continue;
+                if (el.type === 'file') {
+                  if (!el.files || el.files.length === 0) {
+                    out.push({id: el.id, name: el.name,
+                              label: labelFor(el), kind: 'file'});
+                  }
+                  continue;
+                }
+                const widget = isReactDropdown(el);
+                if (widget) {
+                  if (!dropdownHasSelection(widget)) {
+                    out.push({id: el.id, name: el.name,
+                              label: labelFor(el), kind: 'react-dropdown'});
+                  }
+                  continue;
+                }
+                const val = (el.value || '').trim();
+                if (val === '') {
+                  out.push({id: el.id, name: el.name,
+                            label: labelFor(el), kind: el.type || el.tagName.toLowerCase()});
+                }
+              }
+              return out;
+            }
+        """)
+    except Exception:
+        return []
 
 
 def _fill_react_dropdown(page: Any, label: str, value: str) -> bool:

@@ -176,6 +176,40 @@ class GreenhouseApplicantPlain:
                                     "error", phase="dropdown_not_resolved",
                                     field=name, label=label, answer=str(answer),
                                 ))
+                        elif ft == "multi_value_multi_select":
+                            # Resolve the list of label strings to click.
+                            labels_to_click: list[str] = []
+                            opt_val = q.get("optionValue")
+                            opts = q.get("options") or []
+                            if isinstance(opt_val, list) and opt_val:
+                                by_val = {str(o.get("value")): o.get("label")
+                                          for o in opts}
+                                labels_to_click = [
+                                    str(by_val.get(str(v)))
+                                    for v in opt_val
+                                    if by_val.get(str(v))
+                                ]
+                            if not labels_to_click:
+                                labels_to_click = [s.strip()
+                                                    for s in str(answer).split(",")
+                                                    if s.strip()]
+                            picked = _fill_react_multiselect(
+                                page, label, labels_to_click,
+                            )
+                            if picked > 0:
+                                filled += 1
+                                emit(WayfinderEvent.now(
+                                    "progress", phase="field_filled",
+                                    field=name, strategy=strategy,
+                                    via="multiselect", picked=picked,
+                                ))
+                            else:
+                                unhandled.append(label)
+                                emit(WayfinderEvent.now(
+                                    "error", phase="multiselect_not_resolved",
+                                    field=name, label=label,
+                                    answer=str(answer),
+                                ))
                         else:
                             page.get_by_label(label, exact=False).first.fill(
                                 str(answer), timeout=4000,
@@ -679,6 +713,49 @@ def _submit_and_verify(page: Any, *, original_url: str,
     ))
 
     return result
+
+
+def _fill_react_multiselect(page: Any, label: str,
+                             values: list[str]) -> int:
+    """Click-each-option pattern for Greenhouse multi-select dropdowns.
+
+    Opens the field, clicks every target option, dismisses. Returns the
+    number of options successfully clicked.
+    """
+    if not values:
+        return 0
+    try:
+        page.get_by_label(label, exact=False).first.click(timeout=4000)
+    except Exception:
+        return 0
+    page.wait_for_timeout(250)
+
+    clicked = 0
+    for val in values:
+        val = str(val)
+        if not val:
+            continue
+        got_this = False
+        for mk in (
+            lambda v=val: page.get_by_role("option", name=v, exact=True),
+            lambda v=val: page.get_by_role("option", name=v, exact=False),
+            lambda v=val: page.locator('[role="option"]').filter(has_text=v),
+        ):
+            try:
+                mk().first.click(timeout=2500)
+                got_this = True
+                clicked += 1
+                page.wait_for_timeout(150)
+                break
+            except Exception:
+                continue
+        if not got_this:
+            continue
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return clicked
 
 
 def _find_submit_button(page: Any) -> Any:
